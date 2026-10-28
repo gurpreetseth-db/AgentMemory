@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { Application, Request, Response } from 'express';
 import { abAuth, run, workdir } from './agentbricks.js';
@@ -217,11 +217,38 @@ function append(r: TermRun, text: string): void {
   r.output += r.output.length + text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT - r.output.length)}\n[output truncated]` : text;
 }
 
-function resolveCwd(rel: unknown): { abs: string; rel: string } | null {
+const within = (root: string, p: string): boolean => p === root || p.startsWith(root + path.sep);
+
+/** The projects directory with symlinks resolved (created if missing). All containment is checked against it. */
+async function realRoot(): Promise<string> {
   const root = path.resolve(workdir());
-  const abs = path.resolve(root, typeof rel === 'string' ? rel : '');
-  if (abs !== root && !abs.startsWith(root + path.sep)) return null;
-  return { abs, rel: path.relative(root, abs) };
+  await mkdir(root, { recursive: true });
+  return realpath(root);
+}
+
+/**
+ * Resolve `rel` under the projects directory, rejecting anything that escapes it — by `..` or through a
+ * symlink. The target may not exist yet (`init` creates it), so the deepest existing ancestor is
+ * resolved with realpath and the remainder is appended.
+ */
+async function resolveCwd(rel: unknown): Promise<{ abs: string; rel: string } | null> {
+  const root = await realRoot();
+  const lexical = path.resolve(root, typeof rel === 'string' ? rel : '');
+  if (!within(root, lexical)) return null;
+  let probe = lexical;
+  for (;;) {
+    try {
+      const real = path.join(await realpath(probe), path.relative(probe, lexical));
+      if (!within(root, real)) return null;
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = path.dirname(probe);
+      if (parent === probe) return null;
+      probe = parent;
+    }
+  }
+  return { abs: lexical, rel: path.relative(root, lexical) };
 }
 
 function startProcess(cmd: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, notFound: string): TermRun {
@@ -270,7 +297,7 @@ Not available: dev, login, logout (interactive). Projects appear in the main win
 export function registerAbTerminal(app: Application): void {
   app.post('/api/ab/term', async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as { command?: string; cwd?: string };
-    const where = resolveCwd(body.cwd);
+    const where = await resolveCwd(body.cwd);
     if (!where) {
       res.status(400).json({ error: 'cwd is outside the projects directory.' });
       return;
@@ -291,21 +318,21 @@ export function registerAbTerminal(app: Application): void {
       case 'pwd':
         return instant(where.abs);
       case 'cd': {
-        const next = resolveCwd(path.join(where.rel, rest[0] ?? ''));
-        const nextAbs = rest[0] ? next : resolveCwd('');
+        const next = await resolveCwd(path.join(where.rel, rest[0] ?? ''));
+        const nextAbs = rest[0] ? next : await resolveCwd('');
         if (!nextAbs || !(await stat(nextAbs.abs).then((s) => s.isDirectory(), () => false))) {
           return instant(`cd: ${rest[0] ?? ''}: no such directory`, 1);
         }
         return instant('', 0, nextAbs.rel);
       }
       case 'ls': {
-        const target = resolveCwd(path.join(where.rel, rest[0] ?? ''));
+        const target = await resolveCwd(path.join(where.rel, rest[0] ?? ''));
         const names = target ? await readdir(target.abs, { withFileTypes: true }).catch(() => null) : null;
         if (!names) return instant(`ls: ${rest[0] ?? ''}: no such directory`, 1);
         return instant(names.map((d) => (d.isDirectory() ? `${d.name}/` : d.name)).sort().join('\n'));
       }
       case 'cat': {
-        const target = rest[0] ? resolveCwd(path.join(where.rel, rest[0])) : null;
+        const target = rest[0] ? await resolveCwd(path.join(where.rel, rest[0])) : null;
         if (!target) return instant('usage: cat <file inside the projects directory>', 1);
         const info = await stat(target.abs).catch(() => null);
         if (!info?.isFile()) return instant(`cat: ${rest[0]}: no such file`, 1);
@@ -364,10 +391,16 @@ export function registerAbTerminal(app: Application): void {
   // untouched; delete it separately.
   app.delete('/api/ab/projects/:dir', async (req: Request, res: Response) => {
     const dir = String(req.params.dir);
-    const root = path.resolve(workdir());
+    const root = await realRoot();
     const target = path.resolve(root, dir);
     if (!/^[A-Za-z0-9][\w.-]{0,63}$/.test(dir) || path.dirname(target) !== root) {
       res.status(400).json({ ok: false, output: 'Not a project directory name.' });
+      return;
+    }
+    // A symlink (even one pointing inside the projects directory) is never followed or removed here.
+    const info = await lstat(target).catch(() => null);
+    if (info?.isSymbolicLink() || (info && !info.isDirectory())) {
+      res.status(400).json({ ok: false, output: `${dir} is not a plain project directory.` });
       return;
     }
     if (!(await stat(path.join(target, 'agent.toml')).then((s) => s.isFile(), () => false))) {
