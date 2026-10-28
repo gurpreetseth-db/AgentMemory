@@ -121,6 +121,22 @@ Set `AGENTBRICKS_PROFILE` to pick the CLI profile. The engine runs **live** when
 generated files as a **plan** without executing anything. `AGENTBRICKS_USE_CLI=false` forces REST for the
 Supervisor Agent engine.
 
+### Demo: memory vs. a new call
+
+Every answer from an agent built here starts with a provenance label (set in its system prompt, so the model
+chooses it; check the tool messages in the chat to see the real calls):
+
+| Mode | Label | Meaning |
+|---|---|---|
+| Agent Memory | `🧠 From memory` | `recall` found a saved answer; no data tool ran |
+| Agent Memory | `🔎 New call: <tool>` | the sources were queried and the answer was saved |
+| Session Memory | `↩ Earlier in this session` | reused an answer given earlier in this conversation |
+| Session Memory | `🔎 New call (session memory only: ...)` | the sources were queried |
+
+Script: ask a question in session 1 (a new call). Click New Session and ask it again. Agent Memory answers
+`From memory`; Session Memory makes a `New call`, because other sessions aren't visible. Ask it a third time
+in the same session: Session Memory now says `Earlier in this session`.
+
 ## Code Quality
 
 There are a few commands to help you with code quality:
