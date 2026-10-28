@@ -8,6 +8,59 @@ export interface ConsoleEntryRaw {
   response: unknown;
 }
 
+export interface AbStatus {
+  available: boolean;
+  version?: string;
+  uv: boolean;
+  installable?: boolean;
+  mode: 'live' | 'plan';
+  profile?: string;
+  workdir: string;
+}
+
+export interface AbJob {
+  id: string;
+  status: 'running' | 'succeeded' | 'failed' | 'planned';
+  mode: 'live' | 'plan';
+  projectDir: string;
+  steps: ConsoleEntryRaw[];
+  files: Array<{ path: string; content: string }>;
+  agentToml?: string;
+  url?: string;
+  error?: string;
+}
+
+export interface AbBuildBody {
+  name: string;
+  catalog: string;
+  schema: string;
+  tools: Array<{ kind: string; value: string; label?: string }>;
+  memory: 'agent' | 'session';
+  instructions?: string;
+  deploy: boolean;
+  distill?: boolean;
+}
+
+export interface AbProject {
+  dir: string;
+  name: string;
+  deploymentName: string;
+  framework?: string;
+  memoryStore?: string;
+  sessionStore?: string;
+  tools: Array<{ id: string; auth?: string; source: Record<string, unknown> }>;
+  files: string[];
+  mtime: number;
+}
+
+export interface TermStart {
+  id?: string;
+  done: boolean;
+  code?: number | null;
+  output?: string;
+  cwd?: string;
+}
+
 export interface NamedItem {
   name: string;
   comment?: string;
@@ -62,7 +115,39 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
   return (await r.json()) as T;
 }
 
+async function postJSONAllow400<T>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = (await r.json().catch(() => ({}))) as T & { error?: string };
+  if (!r.ok) throw new Error(data.error ?? `${r.status} ${r.statusText}`);
+  return data;
+}
+
 export const api = {
+  abStatus: () => getJSON<AbStatus>('/api/ab/status'),
+  abMcp: (schema?: string) =>
+    getJSON<{ items: Array<{ name: string }>; available: boolean }>(
+      `/api/ab/mcp${schema ? `?schema=${encodeURIComponent(schema)}` : ''}`,
+    ),
+  abBuild: (body: AbBuildBody) => postJSONAllow400<AbJob>('/api/ab/build', body),
+  abJob: (id: string) => getJSON<AbJob>(`/api/ab/jobs/${id}`),
+  abProjects: () => getJSON<{ projects: AbProject[]; workdir: string }>('/api/ab/projects'),
+  abDeleteProject: async (dir: string) => {
+    const r = await fetch(`/api/ab/projects/${encodeURIComponent(dir)}`, { method: 'DELETE' });
+    return (await r.json().catch(() => ({ ok: false, output: `${r.status} ${r.statusText}` }))) as { ok: boolean; output: string };
+  },
+  abDeleteDeployment: async (name: string, deleteSource = false) => {
+    const r = await fetch(`/api/ab/deployments/${encodeURIComponent(name)}?deleteSource=${deleteSource}`, { method: 'DELETE' });
+    return (await r.json().catch(() => ({ ok: false, output: `${r.status} ${r.statusText}` }))) as { ok: boolean; output: string };
+  },
+  abDeployments: () => getJSON<{ items: Array<Record<string, unknown>>; ok: boolean }>('/api/ab/deployments'),
+  termRun: (command: string, cwd: string) => postJSONAllow400<TermStart>('/api/ab/term', { command, cwd }),
+  termPoll: (id: string, from: number) =>
+    getJSON<{ output: string; next: number; done: boolean; code: number | null }>(`/api/ab/term/${id}?from=${from}`),
+  termKill: (id: string) => fetch(`/api/ab/term/${id}`, { method: 'DELETE' }).then(() => undefined),
   whoami: () =>
     getJSON<{ email: string | null; user: string | null; username: string | null; obo: boolean; env: string }>(
       '/api/whoami',

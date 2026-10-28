@@ -1,0 +1,53 @@
+bundle:
+  name: agentbricks-studio
+
+variables:
+  warehouse_id:
+    description: SQL warehouse used for UC metadata queries (information_schema).
+  volume_path:
+    description: Default UC Volume for agent memory, e.g. /Volumes/catalog/schema/volume.
+    default: ''
+
+resources:
+  apps:
+    agentbricks_studio:
+      name: agentbricks-studio-${bundle.target}
+      description: Agent Bricks Studio - build Supervisor Agents and Knowledge Assistants
+      source_code_path: .
+
+      # The server calls these APIs on behalf of the signed-in user (OBO).
+      # Agent Bricks management (/api/2.1/supervisor-agents) is Beta and has no
+      # documented scope yet; if it returns 403 after deploy, add the scope your
+      # workspace admin names to this list.
+      user_api_scopes:
+        - sql
+        - dashboards.genie
+        - files.files
+        - catalog.catalogs
+        - catalog.schemas
+        - catalog.tables
+        - catalog.connections
+        - vectorsearch.vector-search-endpoints
+        - vectorsearch.vector-search-indexes
+        # The CLI window runs `agentbricks` as the signed-in user, so deploys need app management and
+        # workspace file sync. A 403 "token does not have required scopes: X" names anything still missing.
+        - apps
+        - workspace.workspace
+
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+
+targets:
+  default:
+    default: true
+    mode: development
+    # workspace.host comes from your CLI profile: databricks bundle deploy -p <profile>
+
+  prod:
+    mode: production
+    workspace:
+      # host: https://your-workspace.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

@@ -1,1 +1,11 @@
 command: ['npm', 'run', 'start']
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  # Let the Agent Bricks engine and CLI window execute the CLI inside the deployed app.
+  - name: AGENTBRICKS_ENABLE_CLI
+    value: 'true'
+  # Run CLI commands as the app's service principal (the forwarded user token lacks the scopes
+  # agentbricks needs for stores and MCP discovery, and apps cannot be granted them).
+  - name: AGENTBRICKS_AUTH
+    value: 'app'

@@ -45,20 +45,33 @@ import {
   Plug,
   Plus,
   RefreshCw,
+  Rocket,
   Search,
   Sparkles,
+  Terminal,
   Trash2,
   TriangleAlert,
   User,
 } from 'lucide-react';
-import { ConsoleDock, ConsoleProvider, clientEntry, useConsole } from './console';
-import { api, type ConnectionItem, type ContextResult, type GenieSpace, type MemoryFile } from './lib/api';
+import {
+  api,
+  type AbJob,
+  type AbProject,
+  type AbStatus,
+  type ConnectionItem,
+  type ContextResult,
+  type GenieSpace,
+  type MemoryFile,
+} from './lib/api';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 type ToolKind = 'genie' | 'index' | 'function' | 'metric' | 'mcp';
 type MemoryMode = 'agent' | 'session';
+/** What a project's agent.toml binds; a fresh `agentbricks init` binds both stores. */
+type CanvasMemory = MemoryMode | 'both';
+type Engine = 'agentbricks' | 'supervisor';
 
 interface ToolSpec {
   key: string;
@@ -165,15 +178,11 @@ function makeSpec(kind: ToolKind, value: string, display?: string, sub?: string)
 // ---------------------------------------------------------------------------
 export default function App() {
   return (
-    <ConsoleProvider>
-      <Studio />
-      <ConsoleDock />
-    </ConsoleProvider>
+    <Studio />
   );
 }
 
 function Studio() {
-  const { log } = useConsole();
 
   // identity
   const [who, setWho] = useState<{ email: string | null; obo: boolean; env: string } | null>(null);
@@ -200,6 +209,38 @@ function Studio() {
     'Route analytics questions to the Genie space, document lookups to Vector Search, and computations to the UC functions. Cite sources.',
   );
   const [memoryMode, setMemoryMode] = useState<MemoryMode>('agent');
+  const [canvasMemory, setCanvasMemory] = useState<CanvasMemory | null>(null);
+
+  // Agent Bricks CLI engine
+  const [engine, setEngine] = useState<Engine>('agentbricks');
+  const [abStatus, setAbStatus] = useState<AbStatus | null>(null);
+  const [abMcp, setAbMcp] = useState<string[]>([]);
+  const [deployNow, setDeployNow] = useState(true);
+  const [distill, setDistill] = useState(false);
+  const [abJob, setAbJob] = useState<AbJob | null>(null);
+  const [buildError, setBuildError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<AbProject[]>([]);
+  const [deployments, setDeployments] = useState<Array<Record<string, unknown>>>([]);
+  const [selProject, setSelProject] = useState<string | null>(null);
+
+  /** Re-read the projects on disk (agent.toml is the source of truth) and the deployed agents. */
+  const refreshProjects = useCallback(async (selectLatest = false) => {
+    try {
+      const r = await api.abProjects();
+      setProjects(r.projects);
+      setSelProject((cur) =>
+        selectLatest || !cur || !r.projects.some((p) => p.dir === cur) ? (r.projects[0]?.dir ?? null) : cur,
+      );
+    } catch {
+      /* no projects yet */
+    }
+    api.abDeployments().then((d) => setDeployments(d.items)).catch(() => undefined);
+  }, []);
+
+  const onTermDone = useCallback(() => {
+    api.abStatus().then(setAbStatus).catch(() => undefined);
+    void refreshProjects(true);
+  }, [refreshProjects]);
   const [pipeline, setPipeline] = useState(true);
 
   // build output
@@ -215,25 +256,28 @@ function Studio() {
     if (didInit.current) return;
     didInit.current = true;
     api.whoami().then(setWho).catch(() => setWho(null));
+    api.abStatus().then(setAbStatus).catch(() => setAbStatus(null));
+    void refreshProjects();
+    api
+      .abMcp()
+      .then((r) => setAbMcp(r.items.map((i) => i.name)))
+      .catch(() => setAbMcp([]));
     api
       .catalogs()
       .then((r) => {
         setCatalogs(r.items.map((i) => i.name));
-        log(r.console, { label: 'list catalogs' });
       })
       .catch(() => setCatalogs([]));
     api
       .genieSpaces()
       .then((r) => {
         setGenie(r.items);
-        log(r.console, { label: 'list Genie spaces' });
       })
       .catch(() => setGenie([]));
     api
       .connections()
       .then((r) => {
         setConnections(r.items);
-        log(r.console, { label: 'list UC connections (MCP)' });
       })
       .catch(() => setConnections([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -251,7 +295,6 @@ function Studio() {
       .schemas(c)
       .then((r) => {
         setSchemas(r.items.map((i) => i.name));
-        log(r.console, { label: `list schemas in ${c}` });
       })
       .catch(() => setSchemas([]));
   }
@@ -268,9 +311,12 @@ function Studio() {
       .then((r) => {
         setVolumes(r.items.map((v) => ({ name: v.name, path: v.path })));
         if (r.items[0]) setVolumePath(r.items[0].path);
-        log(r.console, { label: `list volumes in ${catalog}.${s}` });
       })
       .catch(() => setVolumes([]));
+    api
+      .abMcp(`${catalog}.${s}`)
+      .then((r) => setAbMcp((prev) => Array.from(new Set([...prev, ...r.items.map((i) => i.name)]))))
+      .catch(() => undefined);
     // context
     setCtxLoading(true);
     setCtx(null);
@@ -278,7 +324,6 @@ function Studio() {
       .context(catalog, s)
       .then((r) => {
         setCtx(r);
-        r.console.forEach((c) => log(c, { label: 'discover context' }));
       })
       .catch(() => setCtx({ functions: [], metricViews: [], indexes: [], console: [] }))
       .finally(() => setCtxLoading(false));
@@ -293,12 +338,15 @@ function Studio() {
       for (const fn of ctx.functions) out.push(makeSpec('function', fn.fullName, fn.name, fn.comment ?? fn.fullName));
       for (const mv of ctx.metricViews) out.push(makeSpec('metric', mv.fullName, mv.name, mv.fullName));
     }
+    if (engine === 'agentbricks') {
+      for (const n of abMcp) out.push(makeSpec('mcp', n, n.split('.').pop() ?? n, 'Managed MCP service'));
+    }
     for (const c of connections) out.push(makeSpec('mcp', c.name, c.name, c.host));
     // Manual entries (resilient to list-scope gaps), de-duped by key.
     const keys = new Set(out.map((t) => t.key));
     for (const m of manualTools) if (!keys.has(m.key)) out.push(m);
     return out;
-  }, [genie, connections, ctx, manualTools]);
+  }, [genie, connections, ctx, manualTools, abMcp, engine]);
 
   function addManual(kind: ToolKind, value: string) {
     const v = value.trim();
@@ -319,7 +367,32 @@ function Studio() {
 
   const selectedList = Object.values(selected);
   const validVolume = /^\/Volumes\/[^/]+\/[^/]+\/[^/]+/.test(volumePath.trim());
-  const canBuild = !!(catalog && schema && validVolume && agentName.trim().length > 0);
+  // Agent Bricks deploys as `agent-bricks-<name>`; names are 2-17 chars of [a-z0-9-].
+  const cliName = agentName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^[^a-z]+/, '')
+    .slice(0, 17)
+    .replace(/-+$/, '');
+  const canBuild =
+    engine === 'agentbricks'
+      ? !!(catalog && schema && cliName.length >= 2)
+      : !!(catalog && schema && validVolume && agentName.trim().length > 0);
+
+  // -------- show the selected Agent Bricks project on the canvas --------
+  useEffect(() => {
+    if (engine !== 'agentbricks') return;
+    const p = projects.find((x) => x.dir === selProject);
+    if (!p) return;
+    setAgent({
+      id: `agent-bricks-${p.deploymentName}`,
+      displayName: p.name,
+      endpoint: findDeploymentUrl(deployments, p.deploymentName) ?? 'local project · not deployed',
+      simulated: false,
+    });
+    setTools(projectTools(p).map((t) => ({ ...t, status: 'attached' as const })));
+    setCanvasMemory(p.memoryStore && p.sessionStore ? 'both' : p.sessionStore ? 'session' : 'agent');
+  }, [engine, projects, selProject, deployments]);
 
   // -------- observatory --------
   const [mem, setMem] = useState<Record<MemoryMode | 'pipeline', MemoryFile[]>>({
@@ -350,7 +423,81 @@ function Studio() {
   }, [volumePath, refreshMemory]);
 
   // -------- the build orchestration --------
+  async function buildViaCli() {
+    if (!canBuild) return;
+    setBuilding(true);
+    setScopeGap(false);
+    setBuildLog([]);
+    setAbJob(null);
+    setAgent(null);
+    setBuildError(null);
+    const say = (m: string) => setBuildLog((l) => [...l, m]);
+    const attachable = (t: ToolSpec) =>
+      t.kind === 'genie' || t.kind === 'function' || t.kind === 'index' || (t.kind === 'mcp' && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(t.key.slice(4)));
+    setTools(selectedList.map((t) => ({ ...t, status: 'pending' as const })));
+    try {
+      say(abStatus?.mode === 'live' ? 'Running the Agent Bricks CLI…' : 'CLI not available here — generating the plan…');
+      let job = await api.abBuild({
+        name: cliName,
+        catalog,
+        schema,
+        memory: memoryMode,
+        instructions,
+        deploy: deployNow,
+        distill: memoryMode === 'agent' && deployNow && distill,
+        tools: selectedList.map((t) => ({
+          kind: t.kind,
+          value: t.key.slice(t.key.indexOf(':') + 1),
+          label: t.label,
+        })),
+      });
+      let seen = 0;
+      const flush = (j: AbJob) => {
+        j.steps.slice(seen).forEach((st) => {
+          say(`${st.ok ? '✓' : '✗'} ${st.cli.split('\n')[0].slice(0, 90)}`);
+        });
+        seen = j.steps.length;
+        setAbJob(j);
+      };
+      flush(job);
+      while (job.status === 'running') {
+        await new Promise((r) => setTimeout(r, 2000));
+        job = await api.abJob(job.id);
+        flush(job);
+      }
+      if (job.error) {
+        say(`Failed: ${job.error}`);
+        setBuildError(job.error);
+      }
+      const done = job.status === 'succeeded' || job.status === 'planned';
+      setTools(
+        selectedList.map((t) => ({
+          ...t,
+          // fn: keys are 'fn:'; a tool the CLI has no type for is reported as not attached
+          status: !attachable(t) || !done ? ('error' as const) : job.mode === 'plan' ? ('simulated' as const) : ('attached' as const),
+        })),
+      );
+      if (done) {
+        setAgent({
+          id: `agent-bricks-${cliName}`,
+          displayName: agentName.trim(),
+          endpoint: job.url ?? (job.mode === 'plan' ? 'plan only — not executed' : deployNow ? 'deployed' : 'not deployed'),
+          simulated: job.mode === 'plan',
+        });
+        say(job.mode === 'plan' ? 'Plan ready. Run these commands locally to create the agent.' : 'Done.');
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      say(`Build request failed: ${msg}`);
+      setBuildError(msg);
+    } finally {
+      setBuilding(false);
+      void refreshProjects(true);
+    }
+  }
+
   async function build() {
+    if (engine === 'agentbricks') return buildViaCli();
     if (!canBuild) return;
     setBuilding(true);
     setScopeGap(false);
@@ -368,7 +515,6 @@ function Studio() {
     let built: BuiltAgent;
     try {
       const res = await api.createAgent({ displayName: agentName.trim(), description, instructions });
-      log(res.console, { label: 'create supervisor agent', simulated: !res.console.ok });
       if (res.console.ok) {
         const a = res.agent as { name?: string; endpoint_name?: string };
         built = {
@@ -416,7 +562,6 @@ function Studio() {
           description: t.description,
           payload: t.payload,
         });
-        log(res.console, { label: `attach tool · ${t.label}`, simulated: !res.console.ok });
         attached[i] = { ...t, status: res.console.ok ? 'attached' : 'simulated' };
         if (!res.console.ok && res.console.status === 403) setScopeGap(true);
         record('attach_tool', res.console.ok ? 'success' : 'simulated', `${t.toolType}:${t.label}`);
@@ -487,25 +632,15 @@ function Studio() {
   async function writeMem(scope: MemoryMode | 'pipeline', key: string, content: unknown, say: (s: string) => void) {
     try {
       const res = await api.memoryWrite({ volumePath, scope, key, content });
-      log(res.console, { label: `write ${scope} memory · ${key}` });
       if (res.error) say(`Volume write failed: ${res.error}`);
     } catch (e) {
-      log(
-        clientEntry(
-          `databricks fs cp ./${key} 'dbfs:${volumePath}/agentbricks-studio/${scope}/${key}'`,
-          { method: 'PUT', path: `${volumePath}/agentbricks-studio/${scope}/${key}` },
-          { error: String(e) },
-          false,
-          500,
-        ),
-        { label: `write ${scope} memory · ${key}` },
-      );
+      say(`Volume write failed: ${String(e)}`);
     }
   }
 
   // -------------------------------------------------------------------------
   return (
-    <div className="min-h-screen bg-background text-foreground pb-[280px]">
+    <div className="min-h-screen bg-background text-foreground pb-8">
       <Header who={who} />
       <main className="mx-auto max-w-[1500px] px-4 py-5 lg:px-6">
         {scopeGap && (
@@ -514,8 +649,8 @@ function Studio() {
             <AlertTitle>Agent Bricks management scope not granted</AlertTitle>
             <AlertDescription>
               The <code className="font-mono">supervisor-agents</code> OAuth scope is not on this app's request token, so
-              create/attach calls return HTTP 403. The flow continues in <strong>simulation</strong> (real CLI + real
-              403 shown in the console); memory, session, and pipeline artifacts below are still written for real. An
+              create/attach calls return HTTP 403. The flow continues in <strong>simulation</strong>; memory,
+              session, and pipeline artifacts below are still written for real. An
               admin can add the scope in the App Space UI → Configuration → user authorization scopes.
             </AlertDescription>
           </Alert>
@@ -545,6 +680,15 @@ function Studio() {
             setInstructions={setInstructions}
             memoryMode={memoryMode}
             setMemoryMode={setMemoryMode}
+            engine={engine}
+            setEngine={setEngine}
+            abStatus={abStatus}
+            cliName={cliName}
+            deployNow={deployNow}
+            setDeployNow={setDeployNow}
+            distill={distill}
+            setDistill={setDistill}
+            buildError={buildError}
             pipeline={pipeline}
             setPipeline={setPipeline}
             canBuild={!!canBuild}
@@ -558,9 +702,39 @@ function Studio() {
               building={building}
               buildLog={buildLog}
               selectedCount={selectedList.length}
-              memoryMode={memoryMode}
+              memoryMode={canvasMemory ?? memoryMode}
             />
-            {agent && (
+            {engine === 'agentbricks' && (
+              <>
+                <AgentProjects
+                  projects={projects}
+                  selected={selProject}
+                  onSelect={setSelProject}
+                  deployments={deployments}
+                  onRefresh={() => void refreshProjects()}
+                  onDelete={async (name) => {
+                    const r = await api.abDeleteDeployment(name);
+                    await refreshProjects();
+                    return r;
+                  }}
+                  onDeleteProject={async (dir) => {
+                    const r = await api.abDeleteProject(dir);
+                    const left = (await api.abProjects().catch(() => ({ projects: [] as AbProject[] }))).projects;
+                    setProjects(left);
+                    setSelProject((cur) => (cur && left.some((p) => p.dir === cur) ? cur : (left[0]?.dir ?? null)));
+                    if (left.length === 0) {
+                      setAgent(null);
+                      setTools([]);
+                      setCanvasMemory(null);
+                    }
+                    return r;
+                  }}
+                />
+                <CliTerminal abStatus={abStatus} onDone={onTermDone} />
+                {abJob && <AbResultCard job={abJob} />}
+              </>
+            )}
+            {engine === 'supervisor' && agent && (
               <AgentChat
                 agent={agent}
                 genieSpaceId={(selectedList.find((t) => t.kind === 'genie')?.key ?? '').replace(/^genie:/, '')}
@@ -640,6 +814,15 @@ interface WizardProps {
   setInstructions: (s: string) => void;
   memoryMode: MemoryMode;
   setMemoryMode: (m: MemoryMode) => void;
+  engine: Engine;
+  setEngine: (e: Engine) => void;
+  abStatus: AbStatus | null;
+  cliName: string;
+  deployNow: boolean;
+  setDeployNow: (b: boolean) => void;
+  distill: boolean;
+  setDistill: (b: boolean) => void;
+  buildError: string | null;
   pipeline: boolean;
   setPipeline: (b: boolean) => void;
   canBuild: boolean;
@@ -663,6 +846,43 @@ function BuildWizard(p: WizardProps) {
   const kinds: ToolKind[] = ['genie', 'index', 'function', 'metric', 'mcp'];
   return (
     <div className="space-y-4">
+      {/* Engine */}
+      <Card>
+        <CardContent className="space-y-2.5 pt-4">
+          <RadioGroup value={p.engine} onValueChange={(v) => p.setEngine(v as Engine)} className="gap-2">
+            <MemOption
+              value="agentbricks"
+              active={p.engine === 'agentbricks'}
+              icon={Terminal}
+              title="Agent Bricks CLI"
+              desc="agentbricks init → tools add → deploy (code-first agent on Databricks Apps)"
+            />
+            <MemOption
+              value="supervisor"
+              active={p.engine === 'supervisor'}
+              icon={Network}
+              title="Supervisor Agent (REST)"
+              desc="Managed Supervisor Agent via databricks supervisor-agents"
+            />
+          </RadioGroup>
+          {p.engine === 'agentbricks' && (
+            <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              <Badge variant={p.abStatus?.mode === 'live' ? 'secondary' : 'outline'} className="gap-1">
+                <Terminal className="h-3 w-3" />
+                {p.abStatus?.mode === 'live'
+                  ? `Live · ${p.abStatus.version ?? 'agentbricks'}`
+                  : 'Plan only · CLI not available here'}
+              </Badge>
+              <span>
+                {p.abStatus?.mode === 'live'
+                  ? 'Commands run on this machine with your CLI profile.'
+                  : 'Shows the exact commands and files; run them locally.'}
+              </span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Step 1: base data */}
       <Card>
         <CardHeader className="pb-3">
@@ -675,13 +895,14 @@ function BuildWizard(p: WizardProps) {
                 <SelectValue placeholder={p.catalogs ? 'Choose a catalog' : 'Loading…'} />
               </SelectTrigger>
               <SelectContent>
-                {(p.catalogs ?? []).map((c) => (
+                {withCurrent(p.catalogs, p.catalog).map((c) => (
                   <SelectItem key={c} value={c}>
                     {c}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            <TypeIn placeholder="…or type a catalog name" onCommit={p.onCatalog} />
           </Field>
           <Field label="Schema">
             <Select value={p.schema} onValueChange={p.onSchema} disabled={!p.catalog}>
@@ -689,13 +910,14 @@ function BuildWizard(p: WizardProps) {
                 <SelectValue placeholder={!p.catalog ? 'Pick a catalog first' : p.schemas ? 'Choose a schema' : 'Loading…'} />
               </SelectTrigger>
               <SelectContent>
-                {(p.schemas ?? []).map((s) => (
+                {withCurrent(p.schemas, p.schema).map((s) => (
                   <SelectItem key={s} value={s}>
                     {s}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            <TypeIn placeholder="…or type a schema name" onCommit={p.onSchema} disabled={!p.catalog} />
           </Field>
         </CardContent>
       </Card>
@@ -784,6 +1006,11 @@ function BuildWizard(p: WizardProps) {
         <CardContent className="space-y-3">
           <Field label="Agent name">
             <Input value={p.agentName} onChange={(e) => p.setAgentName(e.target.value)} placeholder="My Supervisor" />
+            {p.engine === 'agentbricks' && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Deploys as <span className="font-mono">agent-bricks-{p.cliName || '…'}</span> (2-17 chars: a-z, 0-9, -).
+              </p>
+            )}
           </Field>
           <Field label="Instructions">
             <Textarea
@@ -793,6 +1020,7 @@ function BuildWizard(p: WizardProps) {
               className="resize-none"
             />
           </Field>
+          {p.engine === 'supervisor' && (
           <Field label="Memory volume">
             {p.volumes && p.volumes.length > 0 ? (
               <Select value={p.volumePath} onValueChange={p.setVolumePath}>
@@ -825,27 +1053,56 @@ function BuildWizard(p: WizardProps) {
               Files land under <span className="font-mono">/agentbricks-studio/</span>.
             </p>
           </Field>
+          )}
 
           <div>
-            <Label className="mb-1.5 block text-xs text-muted-foreground">Memory mode</Label>
+            <Label className="mb-1.5 block text-xs text-muted-foreground">Memory</Label>
             <RadioGroup value={p.memoryMode} onValueChange={(v) => p.setMemoryMode(v as MemoryMode)} className="gap-2">
               <MemOption
                 value="agent"
                 active={p.memoryMode === 'agent'}
                 icon={BrainCircuit}
                 title="Agent Memory"
-                desc="Persistent — survives across sessions"
+                desc="Long-term facts the agent recalls across conversations"
               />
               <MemOption
                 value="session"
                 active={p.memoryMode === 'session'}
                 icon={MessageSquareText}
                 title="Session Memory"
-                desc="Ephemeral — scoped to this session"
+                desc="The transcript and state of a single conversation"
               />
             </RadioGroup>
+            <MemorySuggest value={p.memoryMode} onApply={p.setMemoryMode} />
+            {p.engine === 'agentbricks' && p.memoryMode === 'agent' && (
+              <div className="mt-2 flex items-center justify-between gap-3 rounded-md border border-border p-2.5">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">Distill sessions into memory</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {p.deployNow
+                      ? 'Keeps the session store too and creates a Dreamer pipeline (scheduled, about every 24h) that turns past conversations into long-term memory.'
+                      : 'Needs Deploy on: the pipeline can only be created once the stores exist.'}
+                  </div>
+                </div>
+                <Switch checked={p.distill && p.deployNow} disabled={!p.deployNow} onCheckedChange={p.setDistill} />
+              </div>
+            )}
           </div>
 
+          {p.engine === 'agentbricks' ? (
+            <div className="flex items-center justify-between rounded-md border border-border p-2.5">
+              <div className="flex items-center gap-2">
+                <Rocket className="h-4 w-4 text-muted-foreground" />
+                <div>
+                  <div className="text-sm font-medium">Deploy after building</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    agentbricks deploy → Databricks Apps (first deploy takes a few minutes)
+                  </div>
+                </div>
+              </div>
+              <Switch checked={p.deployNow} onCheckedChange={p.setDeployNow} />
+            </div>
+          ) : (
           <div className="flex items-center justify-between rounded-md border border-border p-2.5">
             <div className="flex items-center gap-2">
               <GitBranch className="h-4 w-4 text-muted-foreground" />
@@ -856,14 +1113,555 @@ function BuildWizard(p: WizardProps) {
             </div>
             <Switch checked={p.pipeline} onCheckedChange={p.setPipeline} />
           </div>
+          )}
         </CardContent>
       </Card>
 
+      {p.buildError && (
+        <Alert className="border-destructive/40">
+          <TriangleAlert className="h-4 w-4 text-destructive" />
+          <AlertTitle>Build did not run</AlertTitle>
+          <AlertDescription className="break-words">{p.buildError}</AlertDescription>
+        </Alert>
+      )}
+
       <Button className="w-full" size="lg" disabled={!p.canBuild || p.building} onClick={p.onBuild}>
         {p.building ? <Spinner className="mr-2 h-4 w-4" /> : <Sparkles className="mr-2 h-4 w-4" />}
-        {p.building ? 'Building…' : `Build agent · ${Object.keys(p.selected).length} tool(s)`}
+        {p.building
+          ? 'Building…'
+          : p.engine === 'agentbricks'
+            ? `${p.deployNow ? 'Build & deploy' : 'Build'} with Agent Bricks CLI · ${Object.keys(p.selected).length} tool(s)`
+            : `Build agent · ${Object.keys(p.selected).length} tool(s)`}
       </Button>
     </div>
+  );
+}
+
+/** Options for a Select that must also show a value typed by hand. */
+function withCurrent(list: string[] | null, current: string): string[] {
+  const base = list ?? [];
+  return current && !base.includes(current) ? [current, ...base] : base;
+}
+
+/** Free-text entry for names the dropdown can't list (missing catalog scope, other metastore, etc.). */
+function TypeIn({
+  placeholder,
+  onCommit,
+  disabled,
+}: {
+  placeholder: string;
+  onCommit: (v: string) => void;
+  disabled?: boolean;
+}) {
+  const [v, setV] = useState('');
+  const commit = () => {
+    const t = v.trim();
+    if (!t) return;
+    onCommit(t);
+    setV('');
+  };
+  return (
+    <Input
+      value={v}
+      disabled={disabled}
+      onChange={(e) => setV(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commit();
+        }
+      }}
+      placeholder={placeholder}
+      className="mt-1.5 h-8 font-mono text-xs"
+    />
+  );
+}
+
+/** Two questions -> a memory recommendation the user can apply or ignore. */
+function MemorySuggest({ value, onApply }: { value: MemoryMode; onApply: (m: MemoryMode) => void }) {
+  const [remember, setRemember] = useState(false);
+  const [continuity, setContinuity] = useState(true);
+  // Agent Memory holds cross-conversation facts; Session Memory holds one conversation's transcript.
+  const suggestion: MemoryMode = remember ? 'agent' : 'session';
+  const why = remember
+    ? continuity
+      ? 'Users return and the agent should recall them. Its framework already keeps the running chat context within a turn.'
+      : 'The agent should remember preferences and facts about users between conversations.'
+    : continuity
+      ? 'Each conversation needs its own running context, and nothing has to carry over between them.'
+      : 'Conversations stand alone; session storage is the lightest option.';
+  return (
+    <div className="mt-2 space-y-2 rounded-md border border-dashed border-border p-2.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span>Should it recall facts about a user in later conversations?</span>
+        <Switch checked={remember} onCheckedChange={setRemember} />
+      </div>
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span>Does it need context within a single conversation?</span>
+        <Switch checked={continuity} onCheckedChange={setContinuity} />
+      </div>
+      <div className="flex items-start justify-between gap-2 border-t border-border pt-2">
+        <p className="text-[11px] text-muted-foreground">
+          <span className="font-medium text-foreground">
+            Suggested: {suggestion === 'agent' ? 'Agent Memory' : 'Session Memory'}.
+          </span>{' '}
+          {why}
+        </p>
+        {value !== suggestion && (
+          <Button size="sm" variant="outline" className="h-6 shrink-0 px-2 text-[11px]" onClick={() => onApply(suggestion)}>
+            Apply
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Map a project's agent.toml tool bindings (plus generated tool files) to canvas tool specs. */
+function projectTools(p: AbProject): ToolSpec[] {
+  const out: ToolSpec[] = [];
+  for (const t of p.tools) {
+    const src = t.source as Record<string, unknown>;
+    if (src.kind === 'genie_agent') out.push(makeSpec('genie', String(src.space_id), t.id));
+    else if (src.kind === 'uc_function') out.push(makeSpec('function', String(src.function), t.id));
+    else out.push(makeSpec('mcp', String(src.service ?? t.id), t.id, String(src.kind ?? 'tool')));
+  }
+  for (const f of p.files) {
+    const n = f.replace(/\.py$/, '');
+    out.push(makeSpec('index', n, n, `generated tool · agent/tools/${f}`));
+  }
+  return out;
+}
+
+function findDeploymentUrl(items: Array<Record<string, unknown>>, deploymentName: string): string | undefined {
+  const target = `agent-bricks-${deploymentName}`;
+  for (const d of items) {
+    if (String(d.name ?? d.app_name ?? '') === target) {
+      const u = d.url ?? d.app_url;
+      return typeof u === 'string' && u ? u : undefined;
+    }
+  }
+  return undefined;
+}
+
+/** Projects created by the wizard or typed into the CLI window; pick one to show on the canvas. */
+function AgentProjects({
+  projects,
+  selected,
+  onSelect,
+  deployments,
+  onRefresh,
+  onDelete,
+  onDeleteProject,
+}: {
+  projects: AbProject[];
+  selected: string | null;
+  onSelect: (dir: string) => void;
+  deployments: Array<Record<string, unknown>>;
+  onRefresh: () => void;
+  onDelete: (name: string) => Promise<{ ok: boolean; output: string }>;
+  onDeleteProject: (dir: string) => Promise<{ ok: boolean; output: string }>;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  async function del(name: string) {
+    if (!window.confirm(`Delete the deployed agent "${name}"?\n\nThis removes the Databricks App and its URL. It cannot be undone.`)) return;
+    setBusy(name);
+    setErr(null);
+    try {
+      const r = await onDelete(name);
+      if (!r.ok) setErr(r.output || 'Delete failed.');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+  async function delProject(p: AbProject, deployed: boolean) {
+    const note = deployed
+      ? `\n\nThe deployed app agent-bricks-${p.deploymentName} is NOT deleted; remove it from "Deployed agents" if you want it gone too.`
+      : '';
+    if (!window.confirm(`Delete the local project "${p.name}"?\n\nThis removes its folder and files from the Studio's disk. It cannot be undone.${note}`)) return;
+    setBusy(p.dir);
+    setErr(null);
+    try {
+      const r = await onDeleteProject(p.dir);
+      if (!r.ok) setErr(r.output || 'Delete failed.');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Boxes className="h-4 w-4 text-primary" />
+            Agent projects
+            <Badge variant="secondary" className="h-4 px-1 text-[10px]">
+              {projects.length}
+            </Badge>
+          </CardTitle>
+          <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onRefresh}>
+            <RefreshCw className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-1.5">
+        {projects.length === 0 && (
+          <p className="text-xs text-muted-foreground">
+            None yet. Use the wizard, or type <span className="font-mono">agentbricks init my-agent</span> in the CLI
+            window below — it appears here when the command finishes.
+          </p>
+        )}
+        {projects.map((p) => {
+          const url = findDeploymentUrl(deployments, p.deploymentName);
+          const on = p.dir === selected;
+          return (
+            <div
+              key={p.dir}
+              role="button"
+              tabIndex={0}
+              onClick={() => onSelect(p.dir)}
+              onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onSelect(p.dir)}
+              className={`cursor-pointer rounded-md border p-2 text-xs transition-colors ${
+                on ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted/50'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <span className="truncate font-medium">{p.name}</span>
+                <Badge variant={url ? 'secondary' : 'outline'} className="ml-auto h-4 px-1 text-[10px]">
+                  {url ? 'deployed' : 'local'}
+                </Badge>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 w-6 shrink-0 p-0 text-destructive hover:text-destructive"
+                  disabled={busy !== null}
+                  title={`Delete local project ${p.name}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void delProject(p, Boolean(url));
+                  }}
+                >
+                  {busy === p.dir ? <Spinner className="h-3.5 w-3.5" /> : <Trash2 className="h-3.5 w-3.5" />}
+                </Button>
+              </div>
+              <div className="mt-0.5 flex flex-wrap gap-x-3 font-mono text-[11px] text-muted-foreground">
+                <span>{p.tools.length + p.files.length} tool(s)</span>
+                <span>{p.memoryStore ? 'memory' : '—'}</span>
+                <span>{p.sessionStore ? 'sessions' : '—'}</span>
+              </div>
+              {url && (
+                <a href={url} target="_blank" rel="noreferrer" className="mt-0.5 block truncate text-primary underline" onClick={(e) => e.stopPropagation()}>
+                  {url}
+                </a>
+              )}
+            </div>
+          );
+        })}
+        {deployments.length > 0 && (
+          <div className="space-y-1.5 pt-2">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Deployed agents</div>
+            {deployments.map((d) => {
+              const name = String(d.name ?? d.app_name ?? '');
+              const url = typeof d.url === 'string' ? d.url : undefined;
+              const state = deploymentState(d);
+              return (
+                <div key={name} className="flex items-center gap-2 rounded-md border border-border p-2 text-xs">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{name}</div>
+                    {url && (
+                      <a href={url} target="_blank" rel="noreferrer" className="block truncate text-primary underline">
+                        {url}
+                      </a>
+                    )}
+                  </div>
+                  <Badge variant="outline" className="h-4 shrink-0 px-1 text-[10px]">
+                    {state}
+                  </Badge>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 shrink-0 px-2 text-destructive hover:text-destructive"
+                    disabled={busy !== null}
+                    title={`Delete ${name}`}
+                    onClick={() => void del(name)}
+                  >
+                    {busy === name ? <Spinner className="h-3.5 w-3.5" /> : <Trash2 className="h-3.5 w-3.5" />}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {err && (
+          <Alert className="border-destructive/40">
+            <TriangleAlert className="h-4 w-4 text-destructive" />
+            <AlertDescription className="break-words">{err}</AlertDescription>
+          </Alert>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Best-effort status label from an `agentbricks deployments list` item. */
+function deploymentState(d: Record<string, unknown>): string {
+  const pick = (v: unknown): string | undefined =>
+    v && typeof v === 'object' ? (typeof (v as { state?: unknown }).state === 'string' ? String((v as { state: string }).state) : undefined) : undefined;
+  return pick(d.app_status) ?? pick(d.compute_status) ?? 'deployed';
+}
+
+interface TermLine {
+  kind: 'cmd' | 'out' | 'err';
+  text: string;
+}
+
+/** A small terminal: run agentbricks commands by hand; results show up in the projects list and canvas. */
+function CliTerminal({ abStatus, onDone }: { abStatus: AbStatus | null; onDone: () => void }) {
+  const [cwd, setCwd] = useState('');
+  const [lines, setLines] = useState<TermLine[]>([
+    { kind: 'out', text: 'Agent Bricks CLI window. Type help for commands.' },
+  ]);
+  const [input, setInput] = useState('');
+  const [runId, setRunId] = useState<string | null>(null);
+  const history = useRef<string[]>([]);
+  const hpos = useRef(-1);
+  const endRef = useRef<HTMLDivElement>(null);
+  const add = (kind: TermLine['kind'], text: string) => setLines((l) => [...l, { kind, text }]);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [lines]);
+
+  async function exec(raw: string) {
+    const command = raw.trim();
+    if (!command) return;
+    history.current.push(command);
+    hpos.current = -1;
+    setInput('');
+    add('cmd', `/${cwd}$ ${command}`);
+    if (command === 'clear') {
+      setLines([]);
+      return;
+    }
+    try {
+      const r = await api.termRun(command, cwd);
+      if (r.cwd !== undefined) setCwd(r.cwd);
+      if (r.output) add(r.code ? 'err' : 'out', r.output.replace(/\n$/, ''));
+      if (r.id && !r.done) {
+        setRunId(r.id);
+        let next = 0;
+        for (;;) {
+          await new Promise((res) => setTimeout(res, 1000));
+          const p = await api.termPoll(r.id, next);
+          next = p.next;
+          if (p.output) add('out', p.output.replace(/\n$/, ''));
+          if (p.done) {
+            if (p.code) add('err', `exit ${p.code}`);
+            break;
+          }
+        }
+        setRunId(null);
+      }
+      if (/^(agentbricks|install-cli)\b/.test(command)) onDone();
+    } catch (e) {
+      add('err', e instanceof Error ? e.message : String(e));
+      setRunId(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Terminal className="h-4 w-4 text-primary" />
+            CLI window
+          </CardTitle>
+          <Badge variant={abStatus?.available ? 'secondary' : 'outline'} className="gap-1">
+            {abStatus?.available ? (abStatus.version ?? 'agentbricks') : 'agentbricks not installed'}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {abStatus && !abStatus.available && (
+          <Alert>
+            <TriangleAlert className="h-4 w-4" />
+            <AlertDescription>
+              The CLI is not installed in this environment.{' '}
+              {abStatus.installable ? (
+                <>
+                  Type <span className="font-mono">install-cli</span> to install it with uv.
+                </>
+              ) : (
+                'uv is not available here, so it has to be installed from a terminal on this machine.'
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+        <div className="max-h-64 min-h-32 overflow-auto rounded-md bg-muted p-2.5 font-mono text-[11px] leading-relaxed">
+          {lines.map((l, i) => (
+            <pre
+              key={i}
+              className={`whitespace-pre-wrap break-words ${
+                l.kind === 'cmd' ? 'font-semibold text-primary' : l.kind === 'err' ? 'text-destructive' : ''
+              }`}
+            >
+              {l.text}
+            </pre>
+          ))}
+          {runId && (
+            <div className="flex items-center gap-1.5 text-muted-foreground">
+              <Spinner className="h-3 w-3" /> running…
+            </div>
+          )}
+          <div ref={endRef} />
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[11px] text-muted-foreground">/{cwd}$</span>
+          <Input
+            value={input}
+            disabled={Boolean(runId)}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void exec(input);
+              if (e.key === 'ArrowUp' && history.current.length) {
+                e.preventDefault();
+                hpos.current = hpos.current < 0 ? history.current.length - 1 : Math.max(0, hpos.current - 1);
+                setInput(history.current[hpos.current]);
+              }
+              if (e.key === 'ArrowDown' && hpos.current >= 0) {
+                e.preventDefault();
+                hpos.current += 1;
+                setInput(history.current[hpos.current] ?? '');
+                if (hpos.current >= history.current.length) hpos.current = -1;
+              }
+            }}
+            placeholder="agentbricks init --framework langgraph my-agent"
+            className="h-8 font-mono text-xs"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          {runId ? (
+            <Button size="sm" variant="destructive" className="h-8" onClick={() => void api.termKill(runId)}>
+              Stop
+            </Button>
+          ) : (
+            <Button size="sm" className="h-8" onClick={() => void exec(input)}>
+              Run
+            </Button>
+          )}
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {['help', 'install-cli', 'agentbricks init --framework langgraph my-agent', 'ls'].map((c) => (
+            <button
+              key={c}
+              type="button"
+              disabled={Boolean(runId)}
+              onClick={() => setInput(c)}
+              className="rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted"
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** What the Agent Bricks CLI run produced: URL, agent.toml, and generated files. */
+function CommandList({ steps, plan }: { steps: AbJob['steps']; plan: boolean }) {
+  const cmds = steps.filter((st) => st.cli.startsWith('agentbricks'));
+  const [copied, setCopied] = useState(false);
+  if (cmds.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between">
+        <span className="font-medium">{plan ? 'Commands to run' : 'Commands run'}</span>
+        <button
+          type="button"
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+          onClick={() =>
+            void navigator.clipboard?.writeText(cmds.map((c) => c.cli).join('\n')).then(() => {
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1200);
+            })
+          }
+        >
+          {copied ? 'Copied' : 'Copy as script'}
+        </button>
+      </div>
+      <div className="space-y-1 rounded-md bg-muted p-2 font-mono text-[11px]">
+        {cmds.map((c, i) => (
+          <div key={i} className="flex gap-1.5">
+            <span className={c.ok ? 'text-primary' : 'text-destructive'}>{plan ? '$' : c.ok ? '✓' : '✗'}</span>
+            <span className="break-all">{c.cli}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AbResultCard({ job }: { job: AbJob }) {
+  const notes = job.steps.find((st) => st.cli === '# notes')?.response as string[] | undefined;
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Terminal className="h-4 w-4 text-primary" />
+            Agent Bricks project
+          </CardTitle>
+          <Badge
+            variant={job.status === 'failed' ? 'destructive' : 'secondary'}
+            className="gap-1"
+          >
+            {job.status === 'running' && <Spinner className="h-3 w-3" />}
+            {job.status === 'planned' ? 'plan only' : job.status}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3 text-xs">
+        <div className="font-mono text-[11px] text-muted-foreground">{job.projectDir}</div>
+        {job.error && (
+          <Alert className="border-destructive/40">
+            <TriangleAlert className="h-4 w-4 text-destructive" />
+            <AlertDescription>{job.error}</AlertDescription>
+          </Alert>
+        )}
+        <CommandList steps={job.steps} plan={job.mode === 'plan'} />
+        {job.url && (
+          <a href={job.url} target="_blank" rel="noreferrer" className="text-primary underline">
+            Open deployed agent → {job.url}
+          </a>
+        )}
+        {notes?.map((n) => (
+          <p key={n} className="text-warning">
+            {n}
+          </p>
+        ))}
+        {job.agentToml && (
+          <div>
+            <div className="mb-1 font-medium">agent.toml</div>
+            <pre className="max-h-64 overflow-auto rounded-md bg-muted p-2 font-mono text-[11px]">{job.agentToml}</pre>
+          </div>
+        )}
+        {job.files.map((f) => (
+          <details key={f.path}>
+            <summary className="cursor-pointer font-mono">{f.path} (generated)</summary>
+            <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-muted p-2 font-mono text-[11px]">{f.content}</pre>
+          </details>
+        ))}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -986,7 +1784,7 @@ function AgentCanvas({
   building: boolean;
   buildLog: string[];
   selectedCount: number;
-  memoryMode: MemoryMode;
+  memoryMode: CanvasMemory;
 }) {
   return (
     <Card className="min-h-[520px]">
@@ -1033,7 +1831,7 @@ function AgentCanvas({
                 </div>
                 <Badge variant="outline" className="ml-auto gap-1">
                   <BrainCircuit className="h-3 w-3" />
-                  {memoryMode === 'agent' ? 'Agent memory' : 'Session memory'}
+                  {memoryMode === 'both' ? 'Agent + Session memory' : memoryMode === 'agent' ? 'Agent memory' : 'Session memory'}
                 </Badge>
               </div>
             </div>
@@ -1133,7 +1931,6 @@ function AgentChat({
   memoryMode: MemoryMode;
   onWritten: () => void;
 }) {
-  const { log } = useConsole();
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -1157,7 +1954,6 @@ function AgentChat({
     setBusy(true);
     try {
       const r = await api.chat({ message: text, spaceId: genieSpaceId, volumePath, memoryMode, agentSlug, memKey });
-      (r.console ?? []).forEach((c) => log(c, { label: `agent · ${role} · genie`, simulated: false }));
       if (r.error) {
         setMessages((m) => [...m, { role: 'assistant', content: `⚠️ ${r.error}` }]);
       } else {
@@ -1180,7 +1976,6 @@ function AgentChat({
     setRecallNote('Refreshing session — recalling from memory…');
     try {
       const r = await api.recall(volumePath, memoryMode, agentSlug, memKey);
-      log(r.console, { label: `recall ${r.memScope} memory (${groupDesc})`, simulated: false });
       const loaded: ChatMsg[] = (r.turns ?? []).map((t) => ({
         role: t.role === 'user' ? 'user' : 'assistant',
         content: t.content,
@@ -1392,7 +2187,6 @@ function MemoryBrowser({
   volumePath: string;
   refresh: (scope: MemoryMode | 'pipeline') => void;
 }) {
-  const { log } = useConsole();
   const [openPath, setOpenPath] = useState<string | null>(null);
   const [content, setContent] = useState<string>('');
   const [loading, setLoading] = useState(false);
@@ -1416,8 +2210,7 @@ function MemoryBrowser({
 
   async function remove(path: string) {
     try {
-      const r = await api.memoryDelete(path);
-      log(r.console, { label: `delete ${scope} memory` });
+      await api.memoryDelete(path);
     } catch {
       /* ignore */
     }

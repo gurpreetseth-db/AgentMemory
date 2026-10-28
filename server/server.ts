@@ -2,6 +2,10 @@ import { createApp, server, createWorkspaceClient, getExecutionContext } from '@
 import type { WorkspaceClient } from '@databricks/appkit';
 import type { Request, Response } from 'express';
 import { ReadableStream } from '@databricks/sdk-experimental/dist/fetch.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { registerAgentBricks } from './agentbricks.js';
+import { registerAbTerminal } from './abterm.js';
 
 /**
  * Agent Bricks Studio — backend.
@@ -25,6 +29,8 @@ interface ConsoleEntry {
   cli: string;
   request: { method: HttpMethod; path: string; query?: Record<string, unknown>; body?: unknown };
   response: unknown;
+  /** How the call was executed; 'rest' when the CLI binary was unavailable. */
+  via?: 'cli' | 'rest';
 }
 
 /** Resolve a WorkspaceClient scoped to the requesting user (OBO). */
@@ -60,7 +66,7 @@ async function dbx(
       payload: opts.body,
       raw: false,
     });
-    return { ok: true, status: 200, cli: opts.cli, request, response };
+    return { ok: true, status: 200, cli: opts.cli, request, response, via: 'rest' };
   } catch (e: unknown) {
     const err = e as { statusCode?: number; status?: number; message?: string; body?: unknown };
     const status = err?.statusCode ?? err?.status ?? 500;
@@ -70,12 +76,75 @@ async function dbx(
       cli: opts.cli,
       request,
       response: err?.body ?? { error: err?.message ?? String(e) },
+      via: 'rest',
     };
   }
 }
 
 function shellQuote(s: string): string {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+const execFileAsync = promisify(execFile);
+
+/** Render an argv as a copy-pasteable shell command for the CLI console. */
+function cliString(args: string[]): string {
+  return ['databricks', ...args.map((a) => (/^[\w\-./:=@]+$/.test(a) ? a : shellQuote(a)))].join(' ');
+}
+
+/** Env for the CLI child process: authenticate as the requesting user (OBO). */
+function cliEnv(req: Request): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const token = req.header('x-forwarded-access-token');
+  if (!token) return env; // local dev: inherit the developer's CLI auth
+  const host = process.env.DATABRICKS_HOST ?? '';
+  env.DATABRICKS_HOST = /^https?:\/\//.test(host) ? host : `https://${host}`;
+  env.DATABRICKS_TOKEN = token;
+  env.DATABRICKS_AUTH_TYPE = 'pat';
+  env.DATABRICKS_CONFIG_FILE = '/dev/null';
+  delete env.DATABRICKS_CLIENT_ID;
+  delete env.DATABRICKS_CLIENT_SECRET;
+  return env;
+}
+
+/**
+ * Run a Databricks CLI command and shape it into a ConsoleEntry. Falls back to
+ * the equivalent REST call (`fallback`) only when the `databricks` binary is
+ * unavailable (e.g. a deployed App container) or AGENTBRICKS_USE_CLI=false;
+ * a CLI that runs and fails is reported as a failure, not retried over REST.
+ */
+async function dbxCli(
+  req: Request,
+  args: string[],
+  request: ConsoleEntry['request'],
+  fallback: () => Promise<ConsoleEntry>,
+): Promise<ConsoleEntry> {
+  if (process.env.AGENTBRICKS_USE_CLI === 'false') return fallback();
+  const cli = cliString(args);
+  try {
+    const { stdout } = await execFileAsync('databricks', [...args, '-o', 'json'], {
+      env: cliEnv(req),
+      timeout: 60_000,
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    let response: unknown = stdout.trim();
+    try {
+      response = JSON.parse(stdout);
+    } catch {
+      /* keep raw text */
+    }
+    return { ok: true, status: 200, cli, request, response, via: 'cli' };
+  } catch (e: unknown) {
+    const err = e as { code?: string | number; stderr?: string; message?: string };
+    if (err.code === 'ENOENT') return fallback();
+    const message = (err.stderr || err.message || String(e)).trim();
+    // The CLI reports errors as text, not status codes; map the common cases.
+    const status = Number(
+      /\b(401|403|404|409|429)\b/.exec(message)?.[1] ??
+        (/permission|forbidden|scope|not authorized/i.test(message) ? 403 : /does not exist|not found/i.test(message) ? 404 : 500),
+    );
+    return { ok: false, status, cli, request, response: { error: message }, via: 'cli' };
+  }
 }
 
 /** Build a web ReadableStream from a UTF-8 string (for Files API upload). */
@@ -202,6 +271,10 @@ await createApp({
   plugins: [server()],
   async onPluginsReady(appkit) {
     appkit.server.extend((app) => {
+      // ---- Agent Bricks CLI engine (init / tools add / memory / deploy) --
+      registerAgentBricks(app);
+      registerAbTerminal(app);
+
       // ---- Identity -----------------------------------------------------
       app.get('/api/whoami', (req: Request, res: Response) => {
         res.json({
@@ -442,17 +515,20 @@ await createApp({
         const body: Record<string, unknown> = { display_name: displayName };
         if (description) body.description = description;
         if (instructions) body.instructions = instructions;
-        const cli =
-          `databricks supervisor-agents create-supervisor-agent ${shellQuote(displayName)}` +
-          (description ? ` \\\n    --description ${shellQuote(description)}` : '') +
-          (instructions ? ` \\\n    --instructions ${shellQuote(instructions)}` : '');
+        // Flags first, then `--` so a name starting with '-' is not parsed as a flag.
+        const args = [
+          'supervisor-agents',
+          'create-supervisor-agent',
+          ...(description ? ['--description', String(description)] : []),
+          ...(instructions ? ['--instructions', String(instructions)] : []),
+          '--',
+          String(displayName),
+        ];
         try {
-          const entry = await dbx(userClient(req), {
-            method: 'POST',
-            path: '/api/2.1/supervisor-agents',
-            body,
-            cli,
-          });
+          const request = { method: 'POST' as const, path: '/api/2.1/supervisor-agents', body };
+          const entry = await dbxCli(req, args, request, () =>
+            dbx(userClient(req), { ...request, cli: cliString(args) }),
+          );
           res.json({ console: entry, agent: entry.response });
         } catch (e) {
           sendErr(res, e);
@@ -470,16 +546,25 @@ await createApp({
           description: description ?? '',
           ...(payload ?? {}),
         };
-        const cli = `databricks supervisor-agents create-tool supervisor-agents/${id} ${name} --json ${shellQuote(
+        // With --json the CLI takes only PARENT TOOL_ID positionally; tool_type lives in the JSON.
+        const args = [
+          'supervisor-agents',
+          'create-tool',
+          '--json',
           JSON.stringify(body),
-        )}`;
+          '--',
+          `supervisor-agents/${id}`,
+          String(name),
+        ];
         try {
-          const entry = await dbx(userClient(req), {
-            method: 'POST',
+          const request = {
+            method: 'POST' as const,
             path: `/api/2.1/supervisor-agents/${id}/tools`,
             body: { name, ...body },
-            cli,
-          });
+          };
+          const entry = await dbxCli(req, args, request, () =>
+            dbx(userClient(req), { ...request, cli: cliString(args) }),
+          );
           res.json({ console: entry, tool: entry.response });
         } catch (e) {
           sendErr(res, e);

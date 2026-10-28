@@ -104,6 +104,23 @@ Run the production build:
 npm start
 ```
 
+## Agent Bricks CLI engine
+
+The wizard's default engine drives the real [`agentbricks` CLI](https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli)
+(`uv tool install databricks-agentbricks`, plus `databricks auth login --profile <name>`):
+
+1. `agentbricks init` scaffolds a project under `AGENTBRICKS_WORKDIR` (default `~/agentbricks-studio-projects`).
+2. `agentbricks tools add genie-agent | uc-function | mcp` attaches the tools you tick. Vector Search has no CLI
+   tool type, so a LangChain tool module is generated into `agent/tools/`.
+3. Agent Memory / Session Memory / Both keeps the matching managed store in `agent.toml` (`memory unbind` /
+   `sessions unbind` drops the other). Stores are created by `agentbricks deploy`; `agentbricks dev` does not use them.
+4. `agentbricks deploy --no-wait`, then `agentbricks deployments wait`, deploys to Databricks Apps.
+
+Set `AGENTBRICKS_PROFILE` to pick the CLI profile. The engine runs **live** when the binary is present and
+`NODE_ENV` is not `production` (or `AGENTBRICKS_ENABLE_CLI=true`); otherwise it returns the exact commands and
+generated files as a **plan** without executing anything. `AGENTBRICKS_USE_CLI=false` forces REST for the
+Supervisor Agent engine.
+
 ## Code Quality
 
 There are a few commands to help you with code quality:
