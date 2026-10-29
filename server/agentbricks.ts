@@ -114,7 +114,7 @@ export interface AbAuth {
   env: NodeJS.ProcessEnv;
   /** Global `-p <profile>` args; empty when authenticating with a forwarded user token. */
   profile: string[];
-  /** The signed-in user's forwarded token; used for Unity Catalog grants, which the app's own identity can't make. */
+  /** The signed-in user's forwarded token, used to attach app resources the app's own identity can't. */
   userToken?: string;
 }
 
@@ -264,19 +264,13 @@ def _columns(w) -> list[str]:
 @tool
 def ${fnName}(query: str, num_results: int = 5) -> str:
     """Semantic search over ${indexName}. Use for questions answered by documents or knowledge in this index."""
-    # Return failures as text: an exception here would leave the model's tool call without a result
-    # in the saved thread, and every later turn would fail with "tool_use ids were found without
-    # tool_result blocks".
-    try:
-        w = workspace_client()
-        res = w.vector_search_indexes.query_index(
-            index_name=INDEX_NAME,
-            columns=_columns(w),
-            query_text=query,
-            num_results=num_results,
-        )
-    except Exception as e:
-        return f"Vector Search failed on {INDEX_NAME}: {e}"
+    w = workspace_client()
+    res = w.vector_search_indexes.query_index(
+        index_name=INDEX_NAME,
+        columns=_columns(w),
+        query_text=query,
+        num_results=num_results,
+    )
     rows = res.result.data_array if res.result and res.result.data_array else []
     return "\\n".join(str(r) for r in rows) or "No results."
 `;
@@ -394,42 +388,17 @@ export const MEMORY_POLICY = `## Long-term memory
 You have long-term memory tools (recall, remember, forget, list_memories). Memory persists across
 conversations and new sessions, per user. Use it on every turn:
 1. Before calling any data or search tool, call recall with the user's question. If memory already
-   holds an answer to the same or an equivalent question, answer from it and do not call the data
-   tools again. Query the sources again only if the user asks to refresh, re-run or verify, or the
-   stored answer clearly no longer fits.
+   holds an answer to the same or an equivalent question, answer from it, say it came from memory,
+   and do not call the data tools again. Query the sources again only if the user asks to refresh,
+   re-run or verify, or the stored answer clearly no longer fits.
 2. After you answer a question using tools, call remember to save a short self-contained fact in the
    form "Q: <the question> -> A: <the answer, with the key figures>" under the topic "answers".
    Save lasting user preferences and context under the topic "preferences".
-3. If the user corrects a fact, forget the old one and remember the new one.
-
-## Answer provenance label
-Start every answer to a question with exactly one of these lines, then a blank line, then the answer:
-- "🧠 From memory" - you called recall this turn, it returned a matching saved answer, and you called
-  no data tool. Add the saved date in brackets if the memory shows one.
-- "🔎 New call" - you queried the data tools this turn (name them, e.g. "🔎 New call: Genie"). Say
-  "memory had no match" if recall found nothing, or "refreshed" if the user asked you to re-run it.
-Be truthful: never write "From memory" unless recall returned a match in this same turn. Skip the
-label for greetings and small talk.`;
-
-/** Session Memory keeps one conversation's transcript only; it cannot see other sessions. */
-export const SESSION_POLICY = `## Session memory
-Only this conversation's history is available to you. You cannot see other sessions, and you have no
-long-term memory. If the user repeats a question you already answered earlier in this conversation,
-reuse that answer instead of calling the data tools again, unless they ask you to refresh or re-run.
-
-## Answer provenance label
-Start every answer to a question with exactly one of these lines, then a blank line, then the answer:
-- "↩ Earlier in this session" - you reused an answer you gave earlier in this same conversation and
-  called no tool this turn.
-- "🔎 New call (session memory only: other sessions aren't visible)" - you queried the data tools this
-  turn (name them, e.g. "🔎 New call: Genie ..."), including when the same question was asked in an
-  earlier session.
-Be truthful: never claim an answer came from memory or another session. Skip the label for greetings
-and small talk.`;
+3. If the user corrects a fact, forget the old one and remember the new one.`;
 
 /** The system prompt to bake into the agent: the user's instructions plus the memory policy. */
 export function composeInstructions(b: Pick<AbBuildRequest, 'instructions' | 'memory'>): string {
-  return [(b.instructions ?? '').trim(), b.memory === 'agent' ? MEMORY_POLICY : SESSION_POLICY].filter(Boolean).join('\n\n');
+  return [(b.instructions ?? '').trim(), b.memory === 'agent' ? MEMORY_POLICY : ''].filter(Boolean).join('\n\n');
 }
 
 /** Patch the generated agent so the user's instructions become the system prompt. */
