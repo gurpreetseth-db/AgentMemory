@@ -676,7 +676,21 @@ function planOnly(job: AbJob, b: AbBuildRequest, auth: AbAuth): void {
 // Routes
 // ---------------------------------------------------------------------------
 
+/** A redeploy gives the app a fresh container without the CLI; reinstall it so the engine stays live. */
+async function ensureCli(): Promise<void> {
+  const st = await cliStatus();
+  if (st.available || !st.installable) return;
+  console.log('[agentbricks] CLI not found; installing databricks-agentbricks with uv…');
+  try {
+    await execFileAsync('uv', ['tool', 'install', '--upgrade', 'databricks-agentbricks'], { env: baseEnv(), timeout: 300_000 });
+    console.log('[agentbricks] CLI installed.');
+  } catch (e: unknown) {
+    console.warn(`[agentbricks] CLI install failed: ${(e as Error)?.message ?? e}`);
+  }
+}
+
 export function registerAgentBricks(app: Application): void {
+  void ensureCli();
   app.get('/api/ab/status', async (_req: Request, res: Response) => {
     res.json(await cliStatus());
   });
