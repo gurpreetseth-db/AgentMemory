@@ -114,6 +114,8 @@ export interface AbAuth {
   env: NodeJS.ProcessEnv;
   /** Global `-p <profile>` args; empty when authenticating with a forwarded user token. */
   profile: string[];
+  /** The signed-in user's forwarded token; used for Unity Catalog grants, which the app's own identity can't make. */
+  userToken?: string;
 }
 
 /** Base env: `uv tool install` puts executables in ~/.local/bin, which is not on PATH by default. */
@@ -136,7 +138,7 @@ export function abAuth(req?: Request): AbAuth {
     const host = process.env.DATABRICKS_HOST ?? '';
     if (host) env.DATABRICKS_HOST = /^https?:\/\//.test(host) ? host : `https://${host}`;
     env.DATABRICKS_CONFIG_FILE = '/dev/null';
-    return { env, profile: [] };
+    return { env, profile: [], userToken: req?.header('x-forwarded-access-token') };
   }
   const token = req?.header('x-forwarded-access-token');
   if (token) {
@@ -147,7 +149,7 @@ export function abAuth(req?: Request): AbAuth {
     env.DATABRICKS_CONFIG_FILE = '/dev/null';
     delete env.DATABRICKS_CLIENT_ID;
     delete env.DATABRICKS_CLIENT_SECRET;
-    return { env, profile: [] };
+    return { env, profile: [], userToken: token };
   }
   const p = process.env.AGENTBRICKS_PROFILE ?? process.env.DATABRICKS_CONFIG_PROFILE;
   return { env, profile: p ? ['-p', p] : [] };
@@ -441,6 +443,88 @@ export function patchInstructions(src: string, instructions: string): string | n
 }
 
 // ---------------------------------------------------------------------------
+// Grants
+// ---------------------------------------------------------------------------
+
+const hostUrl = (): string => {
+  const h = process.env.DATABRICKS_HOST ?? '';
+  return /^https?:\/\//.test(h) ? h : `https://${h}`;
+};
+
+/** Databricks REST call as the signed-in user; falls back to the CLI profile when running locally. */
+async function dbxApi(auth: AbAuth, method: 'GET' | 'PATCH', apiPath: string, body?: unknown): Promise<Record<string, unknown>> {
+  if (auth.userToken && process.env.DATABRICKS_HOST) {
+    const r = await fetch(`${hostUrl()}${apiPath}`, {
+      method,
+      headers: { Authorization: `Bearer ${auth.userToken}`, 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(`${method} ${apiPath} -> ${r.status} ${text.slice(0, 300)}`);
+    return text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  }
+  const args = [...auth.profile, 'api', method.toLowerCase(), apiPath, ...(body === undefined ? [] : ['--json', JSON.stringify(body)])];
+  const { stdout } = await execFileAsync('databricks', args, { env: auth.env, timeout: 60_000 });
+  return stdout.trim() ? (JSON.parse(stdout) as Record<string, unknown>) : {};
+}
+
+/** SQL to hand to the data owner when the grant could not be made automatically. */
+export function indexGrantSql(index: string, principal: string): string[] {
+  const [catalog, schema] = index.split('.');
+  return [
+    `GRANT USE CATALOG ON CATALOG ${catalog} TO \`${principal}\`;`,
+    `GRANT USE SCHEMA ON SCHEMA ${catalog}.${schema} TO \`${principal}\`;`,
+    `GRANT SELECT ON TABLE ${index.split('.').map((p) => `\`${p}\``).join('.')} TO \`${principal}\`;`,
+  ];
+}
+
+/**
+ * The generated Vector Search tool queries as the deployed app's service principal, which starts with no
+ * access. Grant it read access to each index; a refusal is reported as a note with the SQL to run instead.
+ */
+async function grantIndexAccess(job: AbJob, b: AbBuildRequest, auth: AbAuth): Promise<void> {
+  const indexes = b.tools.filter((t) => t.kind === 'index' && THREE_PART.test(t.value)).map((t) => t.value);
+  if (!indexes.length) return;
+  const appName = `agent-bricks-${b.name}`;
+  let principal = '';
+  try {
+    principal = String((await dbxApi(auth, 'GET', `/api/2.0/apps/${encodeURIComponent(appName)}`)).service_principal_client_id ?? '');
+    if (!principal) throw new Error('app has no service principal yet');
+    const grants = new Map<string, { type: string; name: string; priv: string }>();
+    for (const ix of indexes) {
+      const [c, s] = ix.split('.');
+      grants.set(`c:${c}`, { type: 'catalog', name: c, priv: 'USE_CATALOG' });
+      grants.set(`s:${c}.${s}`, { type: 'schema', name: `${c}.${s}`, priv: 'USE_SCHEMA' });
+      grants.set(`t:${ix}`, { type: 'table', name: ix, priv: 'SELECT' });
+    }
+    for (const g of grants.values()) {
+      await dbxApi(auth, 'PATCH', `/api/2.1/unity-catalog/permissions/${g.type}/${encodeURIComponent(g.name)}`, {
+        changes: [{ principal, add: [g.priv] }],
+      });
+    }
+    job.steps.push({
+      ok: true,
+      status: 200,
+      cli: `# grant ${appName} read access to ${indexes.join(', ')}`,
+      request: { method: 'GRANT', path: indexes.join(', ') },
+      response: { principal, granted: [...grants.values()].map((g) => `${g.priv} on ${g.name}`) },
+    });
+  } catch (e: unknown) {
+    job.steps.push({
+      ok: false,
+      status: 403,
+      cli: `# grant ${appName} read access to ${indexes.join(', ')}`,
+      request: { method: 'GRANT', path: indexes.join(', ') },
+      response: {
+        error: (e as Error)?.message ?? String(e),
+        note: 'Could not grant automatically. Run these as the owner of the data, then start a new chat session.',
+        sql: indexes.flatMap((ix) => indexGrantSql(ix, principal || `<${appName} service principal>`)),
+      },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 
@@ -484,6 +568,7 @@ async function execute(job: AbJob, b: AbBuildRequest, auth: AbAuth): Promise<voi
         }
         job.steps.push(step(cmd, cwd, r, r.code === 0));
         if (r.code !== 0) return fail(`Deployment did not finish: exit ${r.code}.`);
+        await grantIndexAccess(job, b, auth);
         continue;
       }
       const r = await run(cmd.args, cwd, 120_000, auth.env);
