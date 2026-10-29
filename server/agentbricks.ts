@@ -689,8 +689,44 @@ async function ensureCli(): Promise<void> {
   }
 }
 
+/**
+ * The CLI only schedules a Dreamer pipeline about every 24 hours. Start the studio's pipelines
+ * ("<agent>-dreamer") on a short interval instead. Only the identity that created them can run them,
+ * which is the app's own identity here, so this has to run server-side. Default 5 minutes in the deployed app (AGENTBRICKS_AUTH=app), off elsewhere; set AGENTBRICKS_DISTILL_MINUTES to change it, 0 to turn it off.
+ */
+async function distillTick(): Promise<void> {
+  const auth = abAuth();
+  const l = await run([...auth.profile, '-o', 'json', 'memory', 'pipeline', 'list'], process.cwd(), 60_000, auth.env);
+  if (l.code !== 0) return;
+  let names: string[] = [];
+  try {
+    const list = (JSON.parse(l.stdout) as { memory_pipelines?: Array<{ name?: string; display_name?: string }> }).memory_pipelines ?? [];
+    names = list.filter((p) => p.name && p.display_name?.endsWith('-dreamer')).map((p) => p.name as string);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const r = await run([...auth.profile, '-o', 'json', 'memory', 'pipeline', 'run', name], process.cwd(), 120_000, auth.env);
+    console.log(`[agentbricks] memory pipeline run ${name}: ${r.code === 0 ? 'started' : `skipped (${(r.stderr || r.stdout).slice(0, 160).replace(/\s+/g, ' ')})`}`);
+  }
+}
+
+function startDistillLoop(): void {
+  const minutes = Number(process.env.AGENTBRICKS_DISTILL_MINUTES ?? (process.env.AGENTBRICKS_AUTH === 'app' ? '5' : '0'));
+  if (!Number.isFinite(minutes) || minutes <= 0) return;
+  let busy = false;
+  setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void distillTick().catch((e: unknown) => console.warn(`[agentbricks] distill tick failed: ${(e as Error)?.message ?? e}`)).finally(() => {
+      busy = false;
+    });
+  }, minutes * 60_000).unref();
+}
+
 export function registerAgentBricks(app: Application): void {
   void ensureCli();
+  startDistillLoop();
   app.get('/api/ab/status', async (_req: Request, res: Response) => {
     res.json(await cliStatus());
   });
