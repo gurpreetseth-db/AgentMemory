@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -478,50 +478,116 @@ export function indexGrantSql(index: string, principal: string): string[] {
   ];
 }
 
+/** Apps resource names are capped at 30 chars; this prefix keeps them clear of the CLI's `agentbricks-tool-*` pruning. */
+const indexResourceName = (index: string): string => `studio-ix-${createHash('sha256').update(index).digest('hex').slice(0, 13)}`;
+
 /**
  * The generated Vector Search tool queries as the deployed app's service principal, which starts with no
- * access. Grant it read access to each index; a refusal is reported as a note with the SQL to run instead.
+ * access. The index is not in agent.toml, so the CLI does not attach it. Declare it as an app `uc_securable`
+ * resource (the platform grants the principal access; needs only the `apps` scope), then also try direct
+ * Unity Catalog grants (no documented user-token scope covers them, so those may be refused), then check the
+ * result. Failures never fail the build: they add a red step with the SQL for the data owner.
  */
 async function grantIndexAccess(job: AbJob, b: AbBuildRequest, auth: AbAuth): Promise<void> {
   const indexes = b.tools.filter((t) => t.kind === 'index' && THREE_PART.test(t.value)).map((t) => t.value);
   if (!indexes.length) return;
   const appName = `agent-bricks-${b.name}`;
+  const target = indexes.join(', ');
+  const errors: string[] = [];
+  const done: string[] = [];
   let principal = '';
+  const msg = (e: unknown) => (e as Error)?.message ?? String(e);
+
   try {
-    principal = String((await dbxApi(auth, 'GET', `/api/2.0/apps/${encodeURIComponent(appName)}`)).service_principal_client_id ?? '');
+    const app = await dbxApi(auth, 'GET', `/api/2.0/apps/${encodeURIComponent(appName)}`);
+    principal = String(app.service_principal_client_id ?? '');
     if (!principal) throw new Error('app has no service principal yet');
-    const grants = new Map<string, { type: string; name: string; priv: string }>();
-    for (const ix of indexes) {
-      const [c, s] = ix.split('.');
-      grants.set(`c:${c}`, { type: 'catalog', name: c, priv: 'USE_CATALOG' });
-      grants.set(`s:${c}.${s}`, { type: 'schema', name: `${c}.${s}`, priv: 'USE_SCHEMA' });
-      grants.set(`t:${ix}`, { type: 'table', name: ix, priv: 'SELECT' });
-    }
-    for (const g of grants.values()) {
-      await dbxApi(auth, 'PATCH', `/api/2.1/unity-catalog/permissions/${g.type}/${encodeURIComponent(g.name)}`, {
-        changes: [{ principal, add: [g.priv] }],
+
+    // 1. App resources: read, merge, write, so the CLI's own tool resources are preserved.
+    try {
+      const wanted = indexes.map((ix) => ({
+        name: indexResourceName(ix),
+        uc_securable: { securable_full_name: ix, securable_type: 'TABLE', permission: 'SELECT' },
+      }));
+      const names = new Set(wanted.map((w) => w.name));
+      const current = Array.isArray(app.resources) ? (app.resources as Array<{ name?: string }>) : [];
+      await dbxApi(auth, 'PATCH', `/api/2.0/apps/${encodeURIComponent(appName)}`, {
+        resources: [...current.filter((r) => !(r.name && names.has(r.name))), ...wanted],
       });
+      done.push(`app resource: SELECT on ${target}`);
+    } catch (e: unknown) {
+      errors.push(`app resource: ${msg(e)}`);
     }
-    job.steps.push({
-      ok: true,
-      status: 200,
-      cli: `# grant ${appName} read access to ${indexes.join(', ')}`,
-      request: { method: 'GRANT', path: indexes.join(', ') },
-      response: { principal, granted: [...grants.values()].map((g) => `${g.priv} on ${g.name}`) },
-    });
+
+    // 2. Direct grants, belt and braces.
+    try {
+      const grants = new Map<string, { type: string; name: string; priv: string }>();
+      for (const ix of indexes) {
+        const [c, sc] = ix.split('.');
+        grants.set(`c:${c}`, { type: 'catalog', name: c, priv: 'USE_CATALOG' });
+        grants.set(`s:${c}.${sc}`, { type: 'schema', name: `${c}.${sc}`, priv: 'USE_SCHEMA' });
+        grants.set(`t:${ix}`, { type: 'table', name: ix, priv: 'SELECT' });
+      }
+      for (const g of grants.values()) {
+        await dbxApi(auth, 'PATCH', `/api/2.1/unity-catalog/permissions/${g.type}/${encodeURIComponent(g.name)}`, {
+          changes: [{ principal, add: [g.priv] }],
+        });
+      }
+      done.push(`UC grants: ${[...grants.values()].map((g) => `${g.priv} on ${g.name}`).join(', ')}`);
+    } catch (e: unknown) {
+      errors.push(`UC grants: ${msg(e)}`);
+    }
+
+    // 3. Verify what the principal can actually do now.
+    const missing: string[] = [];
+    let verified = true;
+    for (const ix of indexes) {
+      const [c, sc] = ix.split('.');
+      for (const [type, name, priv] of [
+        ['catalog', c, 'USE_CATALOG'],
+        ['schema', `${c}.${sc}`, 'USE_SCHEMA'],
+        ['table', ix, 'SELECT'],
+      ] as const) {
+        try {
+          const r = await dbxApi(
+            auth,
+            'GET',
+            `/api/2.1/unity-catalog/effective-permissions/${type}/${encodeURIComponent(name)}?principal=${encodeURIComponent(principal)}`,
+          );
+          const have = ((r.privilege_assignments as Array<{ privileges?: Array<{ privilege?: string }> }> | undefined) ?? []).flatMap(
+            (a) => (a.privileges ?? []).map((p) => p.privilege),
+          );
+          if (!have.includes(priv) && !have.includes('ALL_PRIVILEGES')) missing.push(`${priv} on ${name}`);
+        } catch {
+          verified = false; // the token may not be allowed to read grants; the result is then unknown, not failed
+        }
+      }
+    }
+    if (!missing.length && (verified || done.length)) {
+      job.steps.push({
+        ok: true,
+        status: 200,
+        cli: `# grant ${appName} read access to ${target}`,
+        request: { method: 'GRANT', path: target },
+        response: { principal, applied: done, verified: verified ? 'principal has the required privileges' : 'could not read effective permissions; test with a question', ...(errors.length ? { skipped: errors } : {}) },
+      });
+      return;
+    }
+    errors.push(`still missing: ${missing.join(', ') || 'nothing was applied'}`);
   } catch (e: unknown) {
-    job.steps.push({
-      ok: false,
-      status: 403,
-      cli: `# grant ${appName} read access to ${indexes.join(', ')}`,
-      request: { method: 'GRANT', path: indexes.join(', ') },
-      response: {
-        error: (e as Error)?.message ?? String(e),
-        note: 'Could not grant automatically. Run these as the owner of the data, then start a new chat session.',
-        sql: indexes.flatMap((ix) => indexGrantSql(ix, principal || `<${appName} service principal>`)),
-      },
-    });
+    errors.push(msg(e));
   }
+  job.steps.push({
+    ok: false,
+    status: 403,
+    cli: `# grant ${appName} read access to ${target}`,
+    request: { method: 'GRANT', path: target },
+    response: {
+      errors,
+      note: 'Could not grant automatically. Run these as the owner of the data, then start a new chat session.',
+      sql: indexes.flatMap((ix) => indexGrantSql(ix, principal || `<${appName} service principal>`)),
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
